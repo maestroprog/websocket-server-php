@@ -1,0 +1,20 @@
+<html>
+<head>
+    <script type="text/javascript">
+        "use strict";
+
+        window.onload = function () {
+            var ws = new WebSocket('ws://127.0.0.1:8898');
+            ws.onmessage = function (msg) {
+                alert('Получил сообщение: ' + msg.data);
+            };
+            ws.onopen = function () {
+                ws.send('HELLO WORLD!');
+            };
+        };
+    </script>
+</head>
+<body>
+<h1>Sample WebSocket server</h1>
+</body>
+</html>
