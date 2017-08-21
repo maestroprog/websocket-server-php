@@ -36,7 +36,7 @@ while (false !== ($activity = $server->wsListen())) {
 
 ```html
 <html>
-<head>z
+<head>
     <script type="text/javascript">
         "use strict";
 
