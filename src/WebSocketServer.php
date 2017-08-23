@@ -10,27 +10,27 @@
  */
 class WebSocketServer
 {
+    const KEY = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+    const READ_TRY = 1000;
+    const READ_TRY_INTERVAL = 10000;
+    const CONNECTION_PING = 60;
+    const CONNECTION_TIMEOUT = 10;
     /**
      * Хранит список адресов подключенных клиентов.
      *
      * @var array
      */
-    public $wsClients = [];
+    public $clients = [];
+    public $wsLogLevel = 0;
 
     private $wsConnection;
-    private $wsLogLevel = 0;
-    private $wsReadTry = 1000;
-    private $wsReadTryInterval = 10000;
-    private $wsConnectionPing = 60;
-    private $wsConnectionTimeout = 10;
 
     /**
      * Создает WebSocket сервер с указанным портом.
      *
-     * @param $port
-     * @return bool
+     * @param int $port
      */
-    public function createWsServer($port)
+    public function __construct($port)
     {
         $this->wsLog('CREATING SERVER ON PORT ' . $port, 0);
         // создаем слушающий сокет с указанным портом
@@ -38,34 +38,31 @@ class WebSocketServer
         socket_setopt($socket, SOL_SOCKET, SO_REUSEADDR, true);
         $error = socket_last_error($socket);
         socket_clear_error();
+
         if (!$socket) {
-            $this->wsLog('SERVER CREATING FAILED with errno: ' . $error, 2);
-            $this->wsConnection = false;
-            return false;
+            throw new RuntimeException('SERVER CREATING FAILED with errno: ' . $error);
         }
-        $this->wsLog('SUCCESSFULLY SERVER CREATED with errno: ' . $error, 1);
+        if ($error) {
+            throw new RuntimeException('Error ' . $error);
+        }
 
         $this->wsConnection = $socket;
         socket_set_nonblock($this->wsConnection);
-        return true;
     }
 
     /**
      * Прекращает работу WebSocket сервера.
-     *
-     * @return bool
      */
-    public function destroyWsServer()
+    public function __destruct()
     {
-        if (!$this->wsConnection) return true;
-        $this->wsLog('destroy the server', 0);
-        foreach ($this->wsClients as $client) {
-            $this->wsDisconnect($client[0], 1000);
+        if (!$this->wsConnection) {
+            return;
+        }
+        foreach ($this->clients as $client) {
+            $this->disconnectClient($client[0], 1000);
         }
         socket_shutdown($this->wsConnection);
         socket_close($this->wsConnection);
-        $this->wsLog('SUCCESSFULLY SERVER DESTROYED', 1);
-        return true;
     }
 
     /**
@@ -74,13 +71,13 @@ class WebSocketServer
      *
      * @return array|bool
      */
-    public function wsListen()
+    public function listen()
     {
         if (!$this->wsConnection) return false;
         $works = [];
         while ($client = socket_accept($this->wsConnection)) {
             socket_set_nonblock($client);
-            $this->wsLog('ACCEPTED NEW CONNECTION OF ' . ($address = $this->getWsAddress($client)), 0);
+            $address = $this->getAddress($client);
 
             // reading headers
             $headers = $data = [];
@@ -89,17 +86,14 @@ class WebSocketServer
             while (true) {
                 $byte = socket_read($client, 1);
                 if ($byte === false)
-                    if ($try++ >= $this->wsReadTry) {
-                        $this->wsLog('error while reading', 1);
-                        $data[] = $buffer;
-                        break;
+                    if ($try++ >= self::READ_TRY) {
+                        throw new RuntimeException('error while reading');
                     } else {
-                        usleep($this->wsReadTryInterval);
+                        usleep(self::READ_TRY_INTERVAL);
                         continue;
                     }
                 $try = 0;
                 if ($byte === "\r") {
-                    // skipping \r
                     continue;
                 }
                 if ($byte === "\n") {
@@ -128,64 +122,72 @@ class WebSocketServer
                 $response = "HTTP/1.1 400 Bad Request\r\n\r\n";
                 socket_write($client, $response);
                 socket_close($client);
-                $this->wsLog('BAD REQUEST 1 OF NEW CONNECTION OF ' . $address . print_r($data, true), 2);
-                return true;
+                throw new UnexpectedValueException('BAD REQUEST 1 OF NEW CONNECTION OF ' . $address . print_r($data, true));
             }
             if (!($headers['Sec-WebSocket-Version']) == 13) {
                 $response = "HTTP/1.1 400 Bad Request\r\n\r\n";
                 socket_write($client, $response);
                 socket_close($client);
-                $this->wsLog('BAD REQUEST 2 OF NEW CONNECTION OF ' . $address . print_r($data, true), 2);
-                return true;
+                throw new UnexpectedValueException('BAD REQUEST 2 OF NEW CONNECTION OF ' . $address . print_r($data, true));
             }
             $cookies = isset($headers['Cookie']) ? $headers['Cookie'] : null;
             // end of reading headers
             // sending headers
-            $hash = base64_encode(sha1($headers['Sec-WebSocket-Key'] . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11', true));
+            $hash = base64_encode(sha1($headers['Sec-WebSocket-Key'] . self::KEY, true));
             $response = "HTTP/1.1 101 Switching Protocols\r\n" .
                 "Upgrade: WebSocket\r\n" .
                 "Connection: Upgrade\r\n" .
                 "Sec-WebSocket-Accept: {$hash}\r\n" .
                 (isset($headers['Sec-WebSocket-Protocol']) ? "Sec-WebSocket-Protocol: chat\r\n\r\n" : "\r\n");
             if (!socket_write($client, $response)) {
-                $this->wsLog('ERROR HANDSHAKE OF NEW CONNECTION OF ' . $address, 2);
                 socket_close($client);
-                return true;
+                throw new RuntimeException('ERROR HANDSHAKE OF NEW CONNECTION OF ' . $address);
             }
             // end of sending headers
-            if (isset($this->wsClients[$address])) {
-                $this->wsLog('FATALITY ERROR!!!', 5);
-//                yii::app()->end();
+            if (isset($this->clients[$address])) {
+                throw new RuntimeException('FATALITY ERROR!!!');
             }
-            $this->wsClients[$address] = [
-                $client, time()
-            ];
+            $this->clients[$address] = [$client, time()];
             $works[] = [$address, $get, $cookies];
         }
         return $works;
     }
 
-    public function wsReadFrom($address)
+    /**
+     * Читает фреймы от указанного клиента.
+     *
+     * @param $address
+     * @return array|bool
+     */
+    public function readFrom($address)
     {
-        if (!isset($this->wsClients[$address])) {
+        if (!isset($this->clients[$address])) {
             return false;
         }
-        $client = $this->wsClients[$address];
-        if ($client[1] < (time() - ($this->wsConnectionPing + $this->wsConnectionTimeout))) {
-            $this->wsDisconnect($address, 1001);
-            $this->wsLog('Timeout while reading from ' . $address, 0);
-            return false;
+        $client = $this->clients[$address];
+        if ($client[1] < (time() - (self::CONNECTION_PING + self::CONNECTION_TIMEOUT))) {
+            $this->disconnectClient($address, 1001);
+            throw new RuntimeException('Timeout while reading from ' . $address);
         }
-        if ($client[1] < (time() - $this->wsConnectionPing)) {
+        if ($client[1] < (time() - self::CONNECTION_PING)) {
             $this->doPing($client[0]);
         }
         return $this->readFramesFrom($client[0]);
     }
 
-    public function wsSendTo($address, $data)
+    /**
+     * Отправляет фрейм клиенту.
+     *
+     * @param $address
+     * @param $data
+     * @return bool
+     */
+    public function sendTo($address, $data)
     {
-        if (!isset($this->wsClients[$address])) return false;
-        return $this->sendFrameTo($this->wsClients[$address][0], $data);
+        if (!isset($this->clients[$address])) {
+            return false;
+        }
+        return $this->sendFrameTo($this->clients[$address][0], $data);
     }
 
     private function readFramesFrom($socket)
@@ -209,12 +211,15 @@ class WebSocketServer
                     $mask = ($byte & 0b10000000) === 128;
                     $length = ($byte & 0b01111111);
 
-                    if ($length === 126)
-                        for ($j = 0, $length = 0; $j < 2; $j++)
+                    if ($length === 126) {
+                        for ($j = 0, $length = 0; $j < 2; $j++) {
                             $length = ($length << 8) | ord($this->_readFrom($socket, 1));
-                    elseif ($length === 127)
-                        for ($j = 0, $length = 0; $j < 8; $j++)
+                        }
+                    } elseif ($length === 127) {
+                        for ($j = 0, $length = 0; $j < 8; $j++) {
                             $length = ($length << 8) | ord($this->_readFrom($socket, 1));
+                        }
+                    }
                     if (!isset($result[$frames])) {
                         $result[$frames] = '';
                     }
@@ -234,20 +239,19 @@ class WebSocketServer
                     case 0x2 : //обозначает двоичный фрейм.
                         break;
                     case 0x8 : //обозначает закрытие соединения этим фреймом.
-                        $this->wsDisconnect($this->getWsAddress($socket), 1000);
-                        $this->wsLog('gived 0x8 disconnect frame', 0);
+                        $this->disconnectClient($this->getAddress($socket), 1000);
+                        // $this->wsLog('gived 0x8 disconnect frame', 0);
                         break;
-                    case 0x9 : //обозначат PING.
+                    case 0x9 : //обозначает PING.
                         $this->sendFrameTo($socket, $result[$frames], 0xA);
                         break;
-                    case 0xA : //обозначат PONG.
+                    case 0xA : //обозначает PONG.
                         $this->onPong($socket);
                         break;
                     case 0x0 :
-                        $this->wsDisconnect($this->getWsAddress($socket), 1002);
-                        $this->wsLog('gived 0x0 disconnect frame', 0);
+                        $this->disconnectClient($this->getAddress($socket), 1002);
+                        // $this->wsLog('gived 0x0 disconnect frame', 0);
                         return false;
-                        break;
                 }
                 if ($opcode < 1 || $opcode > 2) {
                     unset($result[$frames--]);
@@ -265,16 +269,14 @@ class WebSocketServer
         $buffer = '';
         $tryCount = 0;
         while (($in = socket_read($socket, $length)) || $need) {
-            // выжимаем данные из сокета до необходимой длины
             $buffer .= $in;
             if (strlen($in) < $length) {
-                if ($tryCount > $this->wsReadTry) {
+                if ($tryCount > self::READ_TRY) {
                     throw new LengthException('failed receive ' . $length . ' buffer data!!! =(');
-                    break;
                 }
                 $tryCount++;
                 $length -= strlen($in);
-                usleep($this->wsReadTryInterval);
+                usleep(self::READ_TRY_INTERVAL);
             } else {
                 break;
             }
@@ -313,8 +315,7 @@ class WebSocketServer
             if ($result === false) {
                 return false;
             } elseif ($result === 0) {
-                $this->wsLog('WRITTEN 0 BYTES OF ' . $length, 2);
-//                yii::app()->end();
+                // $this->wsLog('WRITTEN 0 BYTES OF ' . $length, 2);
             } else {
                 $data = substr($data, $result);
                 $bytes += $result;
@@ -325,29 +326,27 @@ class WebSocketServer
 
     private function doPing($socket)
     {
-        $this->wsLog('Пингуем ' . $this->getWsAddress($socket), 0);
         $this->sendFrameTo($socket, 'hey', 0x9);
     }
 
     private function onPong($socket)
     {
-        $address = $this->getWsAddress($socket);
-        if (!isset($this->wsClients[$address])) {
-            $this->wsLog('FATAL ERROR: ON PONG ADDRESS NOT FOUND', 2);
-//            yii::app()->end();
+        $address = $this->getAddress($socket);
+        if (!isset($this->clients[$address])) {
+            throw new RuntimeException('FATAL ERROR: ON PONG ADDRESS NOT FOUND');
         }
-        $this->wsLog('Пинг удался ' . $address, 0);
-        $this->wsClients[$address][1] = time();
+        $this->clients[$address][1] = time();
     }
 
-    private function wsDisconnect($address, $code)
+    private function disconnectClient($address, $code)
     {
-        $this->wsLog('manually disconnect ' . $address . ' with code ' . $code, 0);
-        if (!isset($this->wsClients[$address])) return false;
-        $this->sendFrameTo($this->wsClients[$address][0], $code, 0x8);
-        socket_close($this->wsClients[$address][0]);
-        unset($this->wsClients[$address]);
-        $this->onDisconnect($code);
+        if (!isset($this->clients[$address])) {
+            return false;
+        }
+        $this->sendFrameTo($this->clients[$address][0], $code, 0x8);
+        socket_close($this->clients[$address][0]);
+        unset($this->clients[$address]);
+        $this->onDisconnect($address, $code);
         return true;
     }
 
@@ -355,7 +354,7 @@ class WebSocketServer
      * @param $code
      * TODO назначение обработчика
      */
-    public function onDisconnect($code)
+    public function onDisconnect($address, $code)
     {
         //     1000
 //Нормальное закрытие .
@@ -367,7 +366,7 @@ class WebSocketServer
 //Удалённая сторона завершила соединение в связи с тем, что она получила данные, которые не может принять
     }
 
-    private function getWsAddress($socket)
+    private function getAddress($socket)
     {
         if (!$socket) {
             return false;
@@ -381,7 +380,7 @@ class WebSocketServer
         }
     }
 
-    private function wsLog($message, $level = 0)
+    public function wsLog($message, $level = 0)
     {
         if (is_array($message)) {
             $_message = '';
@@ -391,15 +390,7 @@ class WebSocketServer
             $message = $_message;
         }
         if ($level >= $this->wsLogLevel) {
-            if (method_exists($this, 'log')) {
-                $this->log($message, $level);
-            } elseif (method_exists($this, 'monitorLog')) {
-                $this->monitorLog($message, $level);
-            } elseif (method_exists($this, 'stdout')) {
-                $this->stdout($message, $level);
-            } else {
-                fwrite(STDOUT, '[' . date('d.m.Y H:i:s') . '] level:' . $level . '; message: ' . $message . PHP_EOL);
-            }
+            fwrite(STDOUT, '[' . date('d.m.Y H:i:s') . '] level:' . $level . '; message: ' . $message . PHP_EOL);
         }
     }
 }

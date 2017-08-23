@@ -10,17 +10,15 @@
 
 require_once 'src/WebSocketServer.php';
 
-$server = new WebSocketServer();
-
-$server->createWsServer(8898);
+$server = new WebSocketServer(8898);
 
 // слушаем входящие соединения
-while (false !== ($activity = $server->wsListen())) {
+while (false !== ($activity = $server->listen())) {
     // каждую секунду читаем поступающие данные от клиентов
     foreach (array_keys($server->wsClients) as $address) {
-        if ($data = $server->wsReadFrom($address)) {
+        if ($data = $server->readFrom($address)) {
             // эмулируем работу эхо-сервера, отправляем полученные данные клиенту
-            $server->wsSendTo($address, var_export($data, true));
+            $server->sendTo($address, var_export($data, true));
         }
     }
     sleep(1);
